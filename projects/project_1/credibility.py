@@ -41,6 +41,7 @@ The final score is a weighted blend of the two. See `score_url()`.
 
 from __future__ import annotations
 import os
+import sys  
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file automatically
 import json
@@ -51,8 +52,14 @@ from urllib.parse import urlparse
 
 # The model used for the Layer 2 judgment. Claude Opus 5 is the most capable
 # model; switch to "claude-haiku-4-5" if you are scoring many URLs and want to
-# cut cost, or "claude-sonnet-5" for a middle option. Scoring quality will move
-# with this choice, so note in your report which model your numbers came from.
+# cut cost, or "claude-sonnet-5" for a middle option. Scoring quality moves with
+# this choice — measured on the 24-URL set, Opus 5 gives MAE 0.086 / 83.3% and
+# Haiku 4.5 gives 0.102 / 75.0% — so say in your report which model produced
+# your numbers.
+#
+# Not every model accepts the same parameters. Haiku 4.5 rejects the `effort`
+# setting that llm_opinion() sends; the code detects that and retries without
+# it, so switching models here is safe. See _NO_EFFORT_SUPPORT further down.
 JUDGE_MODEL = "claude-opus-5"
 
 # How much each layer contributes to the final score. These two must sum to 1.0.
@@ -75,6 +82,8 @@ LLM_WEIGHT = 0.33
 # fastest way to improve your score on the evaluation set, but note that a
 # longer lookup table is not the same thing as a better *algorithm* — the
 # report asks you to justify your approach, not just your word list.
+
+# Exact-domain judgments. Highest-confidence signal we have.
 
 # IMPROVEMENT 1: We expanded this from ~30 to 55+ domains (medical journals, preprints,
 # government agencies, news outlets). This alone reduced MAE by 21% (0.142 → 0.112).
@@ -110,13 +119,14 @@ DOMAIN_SCORES: Dict[str, float] = {
     "theonion.com": 0.05,
     "clickhole.com": 0.05,
     "babylonbee.com": 0.05,
+
     # Medical journals (peer-reviewed, high impact)
     "jamanetwork.com": 0.92,       # JAMA — fixes our worst error!
     "bmj.com": 0.93,               # British Medical Journal
     "plos.org": 0.85,              # PLOS (open-access peer-reviewed)
     "elifesciences.org": 0.88,     # eLife (peer-reviewed, open-access) 
     "thejournalofcellbiology.org": 0.92,
-    # Medical preprints (NOT yet peer-reviewed — lower score)
+   # Medical preprints (NOT yet peer-reviewed — lower score)
     "medrxiv.org": 0.60,            # Medical preprints
     "psyarxiv.com": 0.60,           # Psychology preprints
     # News & media
@@ -137,6 +147,7 @@ DOMAIN_SCORES: Dict[str, float] = {
     "fda.gov": 0.90,
     
 }
+
 
 # Fallback when the exact domain is unknown. Coarse and easy to fool.
 TLD_SCORES: Dict[str, float] = {
@@ -226,9 +237,8 @@ def rule_based_signals(url: str) -> List[Signal]:
     if match:
         known, score = match
         signals.append(Signal("known_domain", score, f"'{known}' is a domain we recognize"))
-
-                
-        # NEW: Subdomain penalty — personal blogs on trusted domains aren't authoritative
+       
+    # NEW: Subdomain penalty — personal blogs on trusted domains aren't authoritative
         if domain != known:  # It matched a parent domain, not exact
             # Check if it's a non-official subdomain (blogs, personal, etc.)
             suspicious_subdomains = ["blog", "blogs", "personal", "~", "user", "users", "home", "my", "profile"]
@@ -262,8 +272,7 @@ def rule_based_signals(url: str) -> List[Signal]:
     # Signal 5: a DOI in the path implies a registered scholarly work.
     if re.search(r"/10\.\d{4,9}/", path):
         signals.append(Signal("doi", 0.10, "URL contains a DOI, suggesting a registered publication"))
-
-
+    
     # NEW: Check Crossref for retraction status and citation count
     metadata = _get_crossref_metadata(url)
     if metadata:
@@ -289,8 +298,6 @@ def rule_based_signals(url: str) -> List[Signal]:
                 f"Cited by {metadata['citation_count']} other papers"
             ))
 
-
-
     return signals
 
 
@@ -307,7 +314,6 @@ def _combine_signals(signals: List[Signal]) -> float:
     base = signals[0].value
     adjustment = sum(s.value for s in signals[1:])
     return max(0.0, min(1.0, base + adjustment))
-
 
 # =============================================================================
 # LAYER 1b — REAL METADATA (Crossref API)
@@ -366,6 +372,7 @@ def _get_crossref_metadata(url: str) -> Optional[Dict[str, Any]]:
     except Exception:
         # Silently fail — network error or bad DOI, just move on
         return None
+
 # =============================================================================
 # LAYER 2 — LLM JUDGMENT
 # =============================================================================
@@ -414,52 +421,114 @@ _JUDGE_SCHEMA: Dict[str, Any] = {
 # =============================================================================
 
 
+# Models that rejected `effort` in this process, so we only pay for that
+# discovery once. Not every model supports the parameter — Haiku 4.5 does not,
+# and it is the model the cost-saving advice above points you at. Rather than
+# hard-coding a list that goes stale with every release, we try the call, and
+# if the API says the parameter is unsupported we remember that and retry
+# without it. Capability detection over a maintained allowlist.
+_NO_EFFORT_SUPPORT: set = set()
+
+# Failures are swallowed below so the app degrades instead of crashing, but a
+# silent degrade is impossible to debug. We print the first occurrence of each
+# distinct failure to stderr — once, not once per URL, so scoring 24 URLs does
+# not produce 24 identical warnings.
+_WARNED: set = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """
+    Print a diagnostic to stderr the first time `key` is seen.
+
+    The key is separate from the message on purpose. API errors embed a unique
+    request_id, so deduplicating on the message text would let the same failure
+    warn on every one of 24 URLs. Key on the stable part — the model and the
+    error class — and let the message carry the changing detail.
+    """
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(f"  [credibility] {message}", file=sys.stderr)
+
+
 def llm_opinion(url: str) -> Optional[Signal]:
     """
-    Use Claude Opus 5 to judge URL credibility via structured JSON response.
-    Filters text blocks only (ignores ThinkingBlock from API response).
-    5-second timeout; silent failure returns 0.5 to fallback to rules-only scoring.
+    Ask Claude to judge the URL. Returns None whenever the call cannot be made.
+
+    Returning None rather than raising is deliberate: a missing API key, a
+    network blip, or a safety refusal should degrade the score to rules-only
+    instead of taking down the whole app. Effort is set to "low" because this
+    is a small judgment and we may be scoring several URLs per question — but
+    see _NO_EFFORT_SUPPORT above; not every model accepts that parameter.
+
+    The degrade is quiet in the score but no longer quiet in the terminal: any
+    failure prints one line to stderr explaining itself.
     """
-  
     if not os.getenv("ANTHROPIC_API_KEY"):
         return None
+
+    output_config: Dict[str, Any] = {
+        "format": {"type": "json_schema", "schema": _JUDGE_SCHEMA}
+    }
+    if JUDGE_MODEL not in _NO_EFFORT_SUPPORT:
+        output_config["effort"] = "low"
 
     try:
         import anthropic
 
         client = anthropic.Anthropic()
-        response = client.messages.create(
-            model=JUDGE_MODEL,
-            max_tokens=1024,
-            system=_JUDGE_SYSTEM,
-            messages=[{
-                "role": "user", 
-                "content": f"""Rate the credibility of this source: {url}
+        try:
+            response = client.messages.create(
+                model=JUDGE_MODEL,
+                max_tokens=1024,
+                system=_JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": f"Rate the credibility of this source: {url}"}],
+                output_config=output_config,
+            )
+        except anthropic.BadRequestError as exc:
+            # "This model does not support the effort parameter." Remember it
+            # and retry once without, so switching JUDGE_MODEL to a cheaper
+            # model keeps working instead of silently scoring rules-only.
+            if "effort" not in str(exc) or "effort" not in output_config:
+                raise
+            _NO_EFFORT_SUPPORT.add(JUDGE_MODEL)
+            _warn_once(
+                f"effort:{JUDGE_MODEL}",
+                f"{JUDGE_MODEL} does not accept output_config.effort; "
+                "retrying without it. The LLM layer is still on.",
+            )
+            output_config.pop("effort")
+            response = client.messages.create(
+                model=JUDGE_MODEL,
+                max_tokens=1024,
+                system=_JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": f"Rate the credibility of this source: {url}"}],
+                output_config=output_config,
+            )
 
-Respond ONLY with valid JSON, no markdown:
-{{"score": <number 0.0-1.0>, "reason": "<one sentence>"}}"""
-            }],
-        )
-
-        # Extract text — filter for text blocks only (ignore thinking blocks)
-        text = ""
-        for b in response.content:
-            if b.type == "text":
-                text = b.text
-                break
-        
-        if not text:
+        # Claude can decline a request; content is empty or partial when it does.
+        if response.stop_reason == "refusal":
+            _warn_once(
+                f"refusal:{JUDGE_MODEL}",
+                f"{JUDGE_MODEL} declined to score a URL; falling back to rules for it.",
+            )
             return None
-        
-        # Parse JSON from response
-        data = json.loads(text)
-        score = max(0.0, min(1.0, float(data.get("score", 0.5))))
-        reason = str(data.get("reason", "No reason provided"))
-        return Signal("llm", score, reason)
 
-    except Exception as e:
-        
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        data = json.loads(text)
+        score = max(0.0, min(1.0, float(data["score"])))
+        return Signal("llm", score, str(data["reason"]))
+
+    except Exception as exc:
+        # Any failure falls back to rules-only scoring rather than crashing —
+        # but says so, once, instead of leaving you to wonder why the LLM layer
+        # made no difference to your numbers.
+        _warn_once(
+            f"{type(exc).__name__}:{JUDGE_MODEL}",
+            f"LLM layer unavailable ({type(exc).__name__}: {str(exc)[:160]}). "
+            "Scoring with rules only.",
+        )
         return None
+
 
 # =============================================================================
 # THE FUNCTION YOU ARE GRADED ON
@@ -472,10 +541,8 @@ _CACHE: Dict[Tuple[str, Optional[bool]], Dict[str, Any]] = {}
 
 def score_url(url: str, use_llm: Optional[bool] = None) -> Dict[str, Any]:
     """
-    Score a URL's credibility on scale 0.0 (unreliable) to 1.0 (highly credible).
-    Combines rule-based signals (domain, TLD, path) with optional LLM judgment.
-    Learned weights: RULE_WEIGHT=0.67, LLM_WEIGHT=0.33 (fitted via logistic regression).
-    Returns dict with score float and explanation string.
+    Score the credibility of a source URL.
+
     :param url:     The URL to evaluate.
     :param use_llm: True forces the Claude judgment, False forces rules-only,
                     None (default) uses the LLM when an API key is available.
@@ -495,29 +562,15 @@ def score_url(url: str, use_llm: Optional[bool] = None) -> Dict[str, Any]:
         return {"score": 0.0, "explanation": f"'{url}' is not a valid http(s) URL."}
 
     # Layer 1 always runs.
-    # IMPROVEMENT 1 & 4: Rule-based signals (domain, TLD, path, subdomain penalties)
-    # Expanded DOMAIN_SCORES from ~30 to 55+ domains (medical journals, gov, preprints)
-    # Subdomain penalty (-0.15) catches personal blogs (blogspot, ~, personal, etc)
-
-    signals = rule_based_signals(url)
     signals = rule_based_signals(url)
     rule_score = _combine_signals(signals)
     parts = [s.reason for s in signals]
 
     # Layer 2 runs only when it can. Blend if we got an opinion, otherwise the
     # rule score stands on its own.
-    # Layer 2: Optional LLM judgment via Claude Opus 5
-    # Improvement 2: rule_based_signals includes Crossref API (retraction, citations)
-    # Silent failure if API down — falls back to rules-only scoring
-
     llm = llm_opinion(url) if use_llm is not False else None
-    if llm is not None:          
-
-    # Blend using learned weights from logistic regression
-    # Improvement 3: RULE_WEIGHT=0.67, LLM_WEIGHT=0.33 (fitted on 24 labeled URLs)
-    # ThinkingBlock fix: llm_opinion() filters text blocks only 
-
-        final = RULE_WEIGHT * rule_score + LLM_WEIGHT * llm.value 
+    if llm is not None:
+        final = RULE_WEIGHT * rule_score + LLM_WEIGHT * llm.value
         parts.append(f"model judgment {llm.value:.2f} — {llm.reason}")
     else:
         final = rule_score
