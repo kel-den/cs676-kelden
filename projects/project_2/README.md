@@ -7,6 +7,7 @@
 
 | Link | Purpose |
 |------|---------|
+| **[🚀 Live App](https://personaforge.streamlit.app/)** | Try PersonaForge live on Streamlit |
 | **[📄 Technical Report](./CS676_report.pdf)** | Design, transcript commentary, failure analysis, coverage (9 pages) |
 | **[🎬 Video Demo](./livedemo.mp4)** | Live walkthrough of the app |
 | **[📊 Professor's Repo](https://github.com/yiqiao-yin/pace-u-cs676)** | Original project template |
