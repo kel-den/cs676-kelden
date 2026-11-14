@@ -31,11 +31,20 @@ class Conversation:
     topic: str
     participants: List[str]
     turns: List[Turn] = field(default_factory=list)
+    issues: List[str] = field(default_factory=list)  # character-check findings, one per problem
 
     def transcript(self) -> str:
-        """Render as plain text, suitable for saving or printing."""
+        """Render as plain text, suitable for saving or printing.
+
+        Character-check findings are appended as a separate section, so they are
+        visible to a reader of the saved file.
+        """
         header = f"# Conversation: {self.topic}\n\nParticipants: {', '.join(self.participants)}\n\n"
-        return header + "\n\n".join(f"**{t.speaker}:** {t.text}" for t in self.turns)
+        body = "\n\n".join(f"**{t.speaker}:** {t.text}" for t in self.turns)
+        if not self.issues:
+            return header + body
+        checks = "\n".join(f"- {issue}" for issue in self.issues)
+        return header + body + f"\n\n## Character check\n{checks}\n"
 
 
 def run_conversation(
@@ -65,6 +74,9 @@ def run_conversation(
     for i in range(turns):
         speaker = agents[i % len(agents)]
         text = speaker.respond(history)
+        # Record what the character check found, even when the agent passed.
+        for issue in speaker.last_issues:
+            conversation.issues.append(f"Turn {len(conversation.turns) + 1}, {speaker.name}: {issue}")
         if text is None:  # the agent passed: it has nothing to add this turn
             continue
         turn = Turn(speaker=speaker.name, text=text)

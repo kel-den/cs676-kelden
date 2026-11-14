@@ -123,7 +123,7 @@ about 3 calls, and a 6-turn conversation takes about 7.
 uv run pytest
 ```
 
-All tests run offline using `ScriptedLLM`, so no key is needed. Currently: **88 passed,
+All tests run offline using `ScriptedLLM`, so no key is needed. Currently: **96 passed,
 7 skipped**. The 7 skipped tests are the original regex-router tests. I kept them with a
 skip reason instead of deleting them.
 

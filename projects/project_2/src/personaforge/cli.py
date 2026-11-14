@@ -11,6 +11,7 @@ app can be started either way:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,8 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--persona-dir",
-        default=str(DEFAULT_PERSONA_DIR),
-        help=f"where persona .md files are stored (default: {DEFAULT_PERSONA_DIR})",
+        default=os.getenv("PERSONAFORGE_PERSONA_DIR", str(DEFAULT_PERSONA_DIR)),
+        help="where persona .md files are stored (default: $PERSONAFORGE_PERSONA_DIR, else temp/)",
     )
     parser.add_argument("--model", default=None, help="override the Claude model id")
     return parser
